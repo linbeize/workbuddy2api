@@ -29,6 +29,9 @@ type Config struct {
 		// MetricsFile 统计持久化文件；空 = 纯内存（重启清零）。
 		// 默认 ./data/metrics.json，重启后累计值不丢。
 		MetricsFile string `json:"metrics_file"`
+		// MetricsRetentionDays 时间序列保留天数（默认 30）。
+		// 按小时分桶，30 天约 720 桶；超期自动清理，避免文件无界增长。
+		MetricsRetentionDays int `json:"metrics_retention_days"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -123,6 +126,7 @@ func Default() *Config {
 	// 请求统计默认开启并持久化到 state_file 同目录。
 	c.Server.MetricsEnabled = true
 	c.Server.MetricsFile = "./data/metrics.json"
+	c.Server.MetricsRetentionDays = 30
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
@@ -180,6 +184,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_METRICS_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.MetricsRetentionDays = n
 		}
 	}
 	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
@@ -246,6 +255,7 @@ func (c *Config) normalize() error {
 		// 请求统计默认开启并持久化到 state_file 同目录。
 		c.Server.MetricsEnabled = true
 		c.Server.MetricsFile = "./data/metrics.json"
+		c.Server.MetricsRetentionDays = 30
 	}
 	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
 	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。

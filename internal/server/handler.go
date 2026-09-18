@@ -168,14 +168,91 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := h.cfg.Metrics.Derived()
-	writeJSON(w, http.StatusOK, map[string]any{
+
+	resp := map[string]any{
 		"enabled":    true,
 		"since":      snap.Since,
 		"now":        snap.Now,
 		"uptime_sec": snap.UptimeSec,
 		"total":      snap.Total,
 		"models":     snap.Models,
-	})
+		// 时间序列元信息：面板据此展示"数据可回溯到何时"。
+		"series_buckets": h.cfg.Metrics.SeriesBuckets(),
+	}
+
+	// 时间维度查询（可选）：?range=today|7d|30d|all 或 &from=&to=，配合 &interval=hour|day|week
+	if q, ok := parseRangeQuery(r); ok {
+		resp["range"] = h.cfg.Metrics.Range(q)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseRangeQuery 解析时间范围参数；无任何时间参数时返回 ok=false（只返回累计统计）。
+//
+// 支持的写法：
+//
+//	?range=today|yesterday|7d|30d|90d|all   相对区间（便捷）
+//	?from=RFC3339&to=RFC3339                绝对区间（精确选择）
+//	?interval=hour|day|week                 聚合粒度（默认 hour）
+//	?model=<name>                           只看单个模型
+//
+// 非法时间会被忽略而不是报错：统计是观测功能，宁可按默认区间返回也不要 400
+// 让面板整页失败。
+func parseRangeQuery(r *http.Request) (metrics.RangeQuery, bool) {
+	q := r.URL.Query()
+	interval := metrics.NormalizeInterval(q.Get("interval"))
+	model := strings.TrimSpace(q.Get("model"))
+
+	var from, to time.Time
+	hasRange := false
+
+	// 绝对区间优先（用户显式选了时间段）。
+	if v := strings.TrimSpace(q.Get("from")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			from = t
+			hasRange = true
+		}
+	}
+	if v := strings.TrimSpace(q.Get("to")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			to = t
+			hasRange = true
+		}
+	}
+
+	// 相对区间（未给绝对区间时生效）。
+	if !hasRange {
+		now := time.Now()
+		switch strings.ToLower(strings.TrimSpace(q.Get("range"))) {
+		case "today":
+			from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+			to = from.AddDate(0, 0, 1)
+			hasRange = true
+		case "yesterday":
+			to = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+			from = to.AddDate(0, 0, -1)
+			hasRange = true
+		case "7d", "week":
+			from = now.AddDate(0, 0, -7)
+			hasRange = true
+		case "30d", "month":
+			from = now.AddDate(0, 0, -30)
+			hasRange = true
+		case "90d":
+			from = now.AddDate(0, 0, -90)
+			hasRange = true
+		case "all":
+			hasRange = true
+		default:
+			// 未指定 range：仅当显式带了 interval/model 才返回时间序列，
+			// 避免面板不传参数时白白计算一遍。
+			hasRange = q.Get("interval") != "" || model != ""
+		}
+	}
+	if !hasRange {
+		return metrics.RangeQuery{}, false
+	}
+	return metrics.RangeQuery{From: from, To: to, Interval: interval, Model: model}, true
 }
 
 // statsReset 清空统计（运维手动归零，便于观察某个时间点之后的增量）。

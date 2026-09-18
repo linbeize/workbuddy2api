@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,6 +103,12 @@ type Delta struct {
 type Collector struct {
 	mu     sync.Mutex
 	models map[string]*ModelStats
+	// series 按小时分桶的时间序列：桶键（小时）→ 模型 → 统计。
+	//
+	// 为什么按小时存而不是直接按天：按天无法回答"今天下午为什么慢"这类问题；
+	// 按小时既能按天/周聚合（服务端求和），又保留小时级细节。
+	// 保留期默认 30 天（≤720 桶 × 模型数），实测 6665 请求仅数 KB。
+	series map[string]map[string]*ModelStats
 	since  time.Time
 
 	// stateFile 非空时落盘（重启后累计值不丢）。
@@ -111,15 +118,27 @@ type Collector struct {
 	// flushEvery 每 N 次记录落盘一次（避免每个请求都写盘）。
 	flushEvery int
 	sinceFlush int
+	// retention 时间序列保留时长（<=0 用 defaultRetention）。
+	retention time.Duration
+	// nowFunc 便于测试注入时钟；nil 用 time.Now。
+	nowFunc func() time.Time
 }
+
+// defaultRetention 时间序列默认保留时长。
+//
+// 30 天是折中：足够回答"这个月趋势如何"，又不至于让文件无界增长
+// （按小时 720 桶 × 10 模型 ≈ 数千条记录，JSON 约几百 KB）。
+const defaultRetention = 30 * 24 * time.Hour
 
 // New 构建收集器；stateFile 为空表示纯内存（不持久化）。
 func New(stateFile string) *Collector {
 	c := &Collector{
 		models:     map[string]*ModelStats{},
+		series:     map[string]map[string]*ModelStats{},
 		since:      time.Now(),
 		stateFile:  stateFile,
 		flushEvery: 20,
+		retention:  defaultRetention,
 	}
 	if stateFile != "" {
 		c.load()
@@ -127,22 +146,42 @@ func New(stateFile string) *Collector {
 	return c
 }
 
-// Record 记录一次请求。
-func (c *Collector) Record(d Delta) {
-	model := d.Model
-	if model == "" {
-		model = "(unknown)"
-	}
-	now := time.Now()
-
+// SetRetention 设置时间序列保留时长（供配置注入）。
+func (c *Collector) SetRetention(d time.Duration) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.retention = d
+	c.mu.Unlock()
+}
 
-	m, ok := c.models[model]
-	if !ok {
-		m = &ModelStats{Model: model, FirstSeen: now}
-		c.models[model] = m
+// now 返回当前时间（测试可注入）。
+func (c *Collector) now() time.Time {
+	if c.nowFunc != nil {
+		return c.nowFunc()
 	}
+	return time.Now()
+}
+
+// bucketKey 把时刻截断到小时，格式 "2006-01-02T15"（本地时区，便于面板直接展示）。
+//
+// 用**本地时区**分桶而不是 UTC：面板按天/周聚合时，用户期望的是本地自然日，
+// 若按 UTC 分桶则东八区会把 08:00 前的请求算进前一天。
+//
+// 注意：桶不记录时区偏移，聚合时按本地时区解释。跨时区迁移部署会导致
+// 历史桶的含义变化——单机部署场景下可接受。
+func bucketKey(t time.Time) string {
+	return t.Local().Format("2006-01-02T15")
+}
+
+// parseBucketKey 解析桶键回时间（本地时区）。
+func parseBucketKey(k string) (time.Time, error) {
+	return time.ParseInLocation("2006-01-02T15", k, time.Local)
+}
+
+// accumulate 把一次请求的观测值累加进给定统计对象。
+//
+// 抽成公共函数的原因：累计统计与时间序列桶必须用**完全相同**的口径累加，
+// 若两处各写一份，日后改一处漏一处会导致"总览与趋势对不上"的诡异现象。
+func accumulate(m *ModelStats, d Delta, now time.Time) {
 	m.LastSeen = now
 
 	m.Requests++
@@ -185,12 +224,281 @@ func (c *Collector) Record(d Delta) {
 	if d.Credit != 0 {
 		m.CreditMilli += int64(d.Credit*1000 + 0.5)
 	}
+}
+
+// Record 记录一次请求（同时进累计统计与小时时间序列）。
+func (c *Collector) Record(d Delta) {
+	model := d.Model
+	if model == "" {
+		model = "(unknown)"
+	}
+	now := c.now()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 1) 累计统计。
+	m, ok := c.models[model]
+	if !ok {
+		m = &ModelStats{Model: model, FirstSeen: now}
+		c.models[model] = m
+	}
+	accumulate(m, d, now)
+
+	// 2) 小时桶。
+	key := bucketKey(now)
+	bucket, ok := c.series[key]
+	if !ok {
+		bucket = map[string]*ModelStats{}
+		c.series[key] = bucket
+	}
+	bm, ok := bucket[model]
+	if !ok {
+		bm = &ModelStats{Model: model, FirstSeen: now}
+		bucket[model] = bm
+	}
+	accumulate(bm, d, now)
+
+	// 3) 顺带清理过期桶（每次记录时检查开销极小：只在跨桶时才会真正遍历）。
+	c.pruneLocked(now)
 
 	c.dirty = true
 	c.sinceFlush++
 	if c.stateFile != "" && c.sinceFlush >= c.flushEvery {
 		c.saveLocked()
 	}
+}
+
+// pruneLocked 删除超出保留期的桶。调用方必须已持锁。
+//
+// 优化：用一个"上次清理时刻"跳过绝大多数调用——桶只按小时增长，
+// 不必每次请求都遍历整个 series。
+func (c *Collector) pruneLocked(now time.Time) {
+	ret := c.retention
+	if ret <= 0 {
+		ret = defaultRetention
+	}
+	cutoff := now.Add(-ret)
+	for k := range c.series {
+		t, err := parseBucketKey(k)
+		if err != nil {
+			delete(c.series, k) // 无法解析的脏键直接清掉
+			continue
+		}
+		if t.Before(cutoff) {
+			delete(c.series, k)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 时间维度查询
+// ---------------------------------------------------------------------------
+
+// Interval 聚合粒度。
+type Interval string
+
+const (
+	// IntervalHour 按小时（原始桶，不聚合）。
+	IntervalHour Interval = "hour"
+	// IntervalDay 按自然日（本地时区）。
+	IntervalDay Interval = "day"
+	// IntervalWeek 按自然周（周一为起点，本地时区）。
+	IntervalWeek Interval = "week"
+)
+
+// NormalizeInterval 规范化粒度参数，非法值回落 hour。
+func NormalizeInterval(s string) Interval {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "day", "daily", "d":
+		return IntervalDay
+	case "week", "weekly", "w":
+		return IntervalWeek
+	default:
+		return IntervalHour
+	}
+}
+
+// RangeQuery 时间范围查询参数。
+type RangeQuery struct {
+	// From/To 查询区间（含 From、不含 To）；零值表示不限制。
+	From time.Time
+	To   time.Time
+	// Interval 聚合粒度。
+	Interval Interval
+	// Model 非空时只统计该模型。
+	Model string
+}
+
+// Point 时间序列上的一个数据点。
+type Point struct {
+	// Key 分组键（小时桶 "2026-09-14T15" / 日 "2026-09-14" / 周 "2026-W38"）。
+	Key string `json:"key"`
+	// Start 该分组起点（本地时区），面板画图用。
+	Start time.Time `json:"start"`
+	// End 该分组终点（不含）。
+	End time.Time `json:"end"`
+
+	// 该分组内的统计（口径与累计统计一致）。
+	Stats *ModelStats `json:"stats"`
+	// Derived 派生指标（平均延迟/吞吐/命中率等），面板直接展示。
+	Derived Derived `json:"derived"`
+}
+
+// RangeResult 时间范围查询结果。
+type RangeResult struct {
+	Interval Interval  `json:"interval"`
+	From     time.Time `json:"from"`
+	To       time.Time `json:"to"`
+	// Points 按时间升序的数据点。
+	Points []Point `json:"points"`
+	// Total 该范围内所有分组的汇总。
+	Total Derived `json:"total"`
+	// Models 范围内出现过的模型（升序），供面板做模型筛选。
+	Models []string `json:"models"`
+}
+
+// groupKey 把时刻按粒度归组，返回组键与组的起止时间（本地时区）。
+func groupKey(t time.Time, iv Interval) (key string, start, end time.Time) {
+	t = t.Local()
+	switch iv {
+	case IntervalDay:
+		start = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.Local)
+		end = start.AddDate(0, 0, 1)
+		return start.Format("2006-01-02"), start, end
+	case IntervalWeek:
+		// 以周一为一周起点（ISO 习惯，符合中文语境"这周"的直觉）。
+		// Go 的 Weekday()：Sunday=0，需先转换到"距周一的天数"。
+		offset := (int(t.Weekday()) + 6) % 7
+		start = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, -offset)
+		end = start.AddDate(0, 0, 7)
+		isoYear, isoWeek := start.ISOWeek()
+		return fmt.Sprintf("%04d-W%02d", isoYear, isoWeek), start, end
+	default: // hour
+		start = t.Truncate(time.Hour)
+		end = start.Add(time.Hour)
+		return start.Format("2006-01-02T15"), start, end
+	}
+}
+
+// Range 按时间范围聚合查询。
+//
+// 实现取态：从小时桶**滚动求和**，而不是预先物化日/周表。
+// 原因：小时桶是唯一真相源，日/周只是视图——避免了"日表与小时表不一致"
+// 这类经典的双写问题，代价是聚合时多遍历几十个桶（代价可忽略）。
+func (c *Collector) Range(q RangeQuery) RangeResult {
+	iv := q.Interval
+	if iv == "" {
+		iv = IntervalHour
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 先按分组键聚合。
+	type group struct {
+		start, end time.Time
+		models     map[string]*ModelStats
+	}
+	groups := map[string]*group{}
+	modelSet := map[string]bool{}
+
+	for key, bucket := range c.series {
+		t, err := parseBucketKey(key)
+		if err != nil {
+			continue
+		}
+		// 区间过滤：桶的起点落在 [From, To) 内才计入。
+		if !q.From.IsZero() && t.Before(q.From) {
+			continue
+		}
+		if !q.To.IsZero() && !t.Before(q.To) {
+			continue
+		}
+		for model, ms := range bucket {
+			if q.Model != "" && model != q.Model {
+				continue
+			}
+			modelSet[model] = true
+			gk, gstart, gend := groupKey(t, iv)
+			g, ok := groups[gk]
+			if !ok {
+				g = &group{start: gstart, end: gend, models: map[string]*ModelStats{}}
+				groups[gk] = g
+			}
+			dst, ok := g.models[model]
+			if !ok {
+				dst = &ModelStats{Model: model}
+				g.models[model] = dst
+			}
+			addInto(dst, ms)
+		}
+	}
+
+	// 转成有序数据点。
+	points := make([]Point, 0, len(groups))
+	total := &ModelStats{Model: "(all)"}
+	for k, g := range groups {
+		merged := &ModelStats{Model: "(all)"}
+		for _, ms := range g.models {
+			addInto(merged, ms)
+		}
+		addInto(total, merged)
+		points = append(points, Point{
+			Key:     k,
+			Start:   g.start,
+			End:     g.end,
+			Stats:   merged,
+			Derived: Derive(merged),
+		})
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].Start.Before(points[j].Start) })
+
+	models := make([]string, 0, len(modelSet))
+	for m := range modelSet {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+
+	out := RangeResult{
+		Interval: iv,
+		Points:   points,
+		Total:    Derive(total),
+		Models:   models,
+	}
+	// 回填实际生效的区间边界（面板展示"显示的是哪段"）。
+	if len(points) > 0 {
+		out.From = points[0].Start
+		out.To = points[len(points)-1].End
+	} else {
+		out.From = q.From
+		out.To = q.To
+	}
+	return out
+}
+
+// Series 返回时间序列的原始桶数（供 /v1/stats 透出，便于判断保留期）。
+func (c *Collector) SeriesBuckets() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.series)
+}
+
+// EarliestBucket 返回最早桶的起点（无数据时为零值）。
+func (c *Collector) EarliestBucket() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var earliest time.Time
+	for k := range c.series {
+		t, err := parseBucketKey(k)
+		if err != nil {
+			continue
+		}
+		if earliest.IsZero() || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	return earliest
 }
 
 // Snapshot 返回当前累计统计的深拷贝（含全模型汇总）。
@@ -218,6 +526,7 @@ func (c *Collector) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.models = map[string]*ModelStats{}
+	c.series = map[string]map[string]*ModelStats{}
 	c.since = time.Now()
 	c.dirty = true
 	c.saveLocked()
@@ -269,6 +578,11 @@ func addInto(dst, src *ModelStats) {
 type stateFile struct {
 	Since  time.Time              `json:"since"`
 	Models map[string]*ModelStats `json:"models"`
+	// Series 按小时分桶的时间序列（旧文件缺此字段 → nil，向后兼容：
+	// 累计统计照常恢复，时间趋势从该次启动重新累积）。
+	Series map[string]map[string]*ModelStats `json:"series,omitempty"`
+	// RetentionSec 落盘时的保留期（秒），供排查"桶为何被清理"。
+	RetentionSec int64 `json:"retention_sec,omitempty"`
 }
 
 // saveLocked 原子落盘。调用方必须已持锁。
@@ -279,7 +593,12 @@ func (c *Collector) saveLocked() {
 	if c.stateFile == "" {
 		return
 	}
-	raw, err := json.MarshalIndent(stateFile{Since: c.since, Models: c.models}, "", "  ")
+	raw, err := json.MarshalIndent(stateFile{
+		Since:        c.since,
+		Models:       c.models,
+		Series:       c.series,
+		RetentionSec: int64(c.retention / time.Second),
+	}, "", "  ")
 	if err != nil {
 		return
 	}
@@ -306,9 +625,14 @@ func (c *Collector) load() {
 	if sf.Models != nil {
 		c.models = sf.Models
 	}
+	if sf.Series != nil {
+		c.series = sf.Series
+	}
 	if !sf.Since.IsZero() {
 		c.since = sf.Since
 	}
+	// 启动时清理一次过期桶：进程可能停机数天，期间无请求触发清理。
+	c.pruneLocked(c.now())
 }
 
 // ---------------------------------------------------------------------------

@@ -118,6 +118,7 @@ func main() {
 	var metricsCollector *metrics.Collector
 	if cfg.Server.MetricsEnabled {
 		metricsCollector = metrics.New(cfg.Server.MetricsFile)
+		metricsCollector.SetRetention(time.Duration(cfg.Server.MetricsRetentionDays) * 24 * time.Hour)
 		defer metricsCollector.Flush() // 退出前落盘
 	}
 
@@ -151,7 +152,8 @@ func main() {
 	}()
 
 	if cfg.Server.MetricsEnabled {
-		log.Printf("请求统计: 已启用 → %s（GET /v1/stats）", cfg.Server.MetricsFile)
+		log.Printf("请求统计: 已启用 → %s（GET /v1/stats，时间序列保留 %d 天）",
+			cfg.Server.MetricsFile, cfg.Server.MetricsRetentionDays)
 	} else {
 		log.Printf("请求统计: 已禁用（server.metrics_enabled=false）")
 	}
