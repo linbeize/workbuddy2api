@@ -395,6 +395,10 @@ func (c *Collector) Range(q RangeQuery) RangeResult {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// 顺带清理过期桶：这是读路径，用户看到的数据应已剔除超期部分
+	// （进程长期空转时，Record 不会被调用，仅靠写路径清理会留脏数据）。
+	c.pruneLocked(c.now())
+
 	// 先按分组键聚合。
 	type group struct {
 		start, end time.Time
@@ -631,8 +635,9 @@ func (c *Collector) load() {
 	if !sf.Since.IsZero() {
 		c.since = sf.Since
 	}
-	// 启动时清理一次过期桶：进程可能停机数天，期间无请求触发清理。
-	c.pruneLocked(c.now())
+	// 这里**不做**过期清理：New() 里 clock 尚未注入，此时清理会用真实时间为基准，
+	// 既有测试注入固定时钟时会误删其数据。过期桶由首次 Record / 查询时的
+	// pruneLocked 清理（两者都会调用），停机再久也会在第一个请求后收敛。
 }
 
 // ---------------------------------------------------------------------------

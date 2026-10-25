@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -112,6 +113,17 @@ func main() {
 	}
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+	}
+
+	// 请求体结构诊断开关（默认关闭）。开启后仅在被上游 4xx 拒绝时打印请求
+	// 的**字段结构**（不含任何内容），用于排查「某客户端发的请求上游不认」。
+	if v := os.Getenv("WB2A_DEBUG_BODY"); v == "1" || strings.EqualFold(v, "true") {
+		server.SetDebugBody(true)
+		log.Printf("请求体诊断: 已开启（4xx 时打印字段结构，不含内容）")
+		if d := os.Getenv("WB2A_DEBUG_BODY_SAVE"); d != "" {
+			server.SetDebugBodySaveDir(d)
+			log.Printf("请求体落盘: 已开启 → %s（含原始内容，仅排障用，用完请删除）", d)
+		}
 	}
 
 	// 请求统计收集器：网关是所有流量的必经点，在此采集（含绕过面板的客户端）。

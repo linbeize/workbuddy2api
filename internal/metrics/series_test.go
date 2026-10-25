@@ -267,7 +267,10 @@ func TestSeriesPersisted(t *testing.T) {
 	c.Record(Delta{Model: "m", OK: true, HasUsage: true, CompletionTokens: 42})
 	c.Flush()
 
+	// 重启后的 collector 也必须用同一时刻的时钟：load() 会按 retention 清理过期桶，
+	// 若这里用真实 time.Now()，2026-09-14 的桶会被判为过期删掉（测试假失败）。
 	c2 := New(fp)
+	c2.nowFunc = func() time.Time { return now }
 	res := c2.Range(RangeQuery{Interval: IntervalHour})
 	if len(res.Points) != 1 {
 		t.Fatalf("重启后应恢复 1 个小时桶, 得到 %d", len(res.Points))

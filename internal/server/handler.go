@@ -773,6 +773,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			// 4xx 客户端类错误时按需 dump 请求「结构」（字段名/role 序列/类型），
+			// 用于定位「某个客户端发的请求上游不认」这类问题——上游只回一句
+			// 「Illegal API invocation」，看不到究竟哪个字段触发的。
+			// 只在 debugBodyTriggers 开启时输出，且**不含任何内容**（见 dumpBodyShape）。
+			if debugBodyTriggers && status >= 400 && status < 500 {
+				log.Printf("chat rejected uid=%s model=%s status=%d kind=%s shape=%s",
+					uidPrefix(acct.UID), peek.Model, status, kind, dumpBodyShape(body))
+			}
+			// 需要原样 body 时（摘要不足以定位），另开落盘开关。
+			if status >= 400 && status < 500 {
+				saveRejectedBody(acct.UID, body)
+			}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
 			fail(acct.UID)
 			continue

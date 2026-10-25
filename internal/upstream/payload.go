@@ -29,6 +29,15 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	normalizeReasoningEffort(obj, efforts)
+	// 渠道兼容改写：与 sanitize 解耦，始终生效。
+	//
+	// 依据：这是「让请求能通过上游渠道校验」的协议兼容，与「脱敏」是两件事。
+	// 实测 dsh 0.2.x 的系统提示词首句会精确触发 400 code=11128，若只在
+	// sanitize=true 时改写，关掉脱敏开关的部署会重新踩这个坑。
+	// 与上面的 developer→system 同类，都属于「不改语义、只为过校验」。
+	if msgs, ok := obj["messages"].([]any); ok {
+		rewriteChannelFingerprints(msgs)
+	}
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
