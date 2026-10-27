@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -28,6 +30,27 @@ type Config struct {
 	CheckinDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
+
+	// Record 执行记录收集器（可选；nil = 只打日志不记录）。
+	// 面板靠它展示签到/旅行/保活的历史结果——这些原先只写 stdout，容器日志
+	// 一滚动就查不到，重启也没了。
+	Record *record.Collector
+}
+
+// rec 记一条执行记录（Record 为 nil 时什么也不做，便于测试与嵌入场景）。
+func (s *Scheduler) rec(e record.Entry) {
+	if s.cfg.Record == nil {
+		return
+	}
+	s.cfg.Record.Add(e)
+}
+
+// nicknameOf 取账号昵称（记录冗余存一份，账号删除后历史仍可读）。
+func nicknameOf(a *auth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	return a.Nickname
 }
 
 // Scheduler 调度器。
@@ -155,14 +178,30 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			log.Printf("checkin %s: %v", st.UID, err)
-			// 已签到等业务错误也继续走余额查询
+			// 已签到等业务错误也继续走余额查询；记录为「跳过」而非失败——
+			// 重复签到属正常情况，标成失败会让面板全是红色噪音。
+			s.rec(record.Entry{
+				Kind: record.KindCheckin, UID: st.UID, Nickname: nicknameOf(a),
+				Status: record.StatusSkipped, Message: err.Error(), Credits: -1,
+			})
 		}
 		remain, err := s.cfg.Upstream.UserResource(a)
 		if err != nil {
 			log.Printf("user-resource %s: %v", st.UID, err)
+			s.rec(record.Entry{
+				Kind: record.KindCheckin, UID: st.UID, Nickname: nicknameOf(a),
+				Status: record.StatusFailed, Message: "查询余额失败: " + err.Error(), Credits: -1,
+			})
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		// 只有签到没报错才记一条 ok（报错时上面已记 skipped，避免同一次任务两条记录）。
+		if err == nil {
+			s.rec(record.Entry{
+				Kind: record.KindCheckin, UID: st.UID, Nickname: nicknameOf(a),
+				Status: record.StatusOK, Message: "签到成功", Credits: remain,
+			})
+		}
 	}
 	// 签到收尾（09/21 点）：顺带推进一趟旅行状态机（领养 / 派出 / 领奖）。
 	s.RunTravelNow()
@@ -180,6 +219,10 @@ func (s *Scheduler) RunKeepaliveNow() {
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", st.UID, err)
+			s.rec(record.Entry{
+				Kind: record.KindKeepalive, UID: st.UID, Nickname: nicknameOf(a),
+				Status: record.StatusFailed, Message: "刷新 token 失败: " + err.Error(), Credits: -1,
+			})
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				// 连续 N 次才判死：12153 会被临时性触发（网络抖动/上游闪断/refresh
@@ -195,6 +238,15 @@ func (s *Scheduler) RunKeepaliveNow() {
 		s.cfg.Pool.ClearSessionDead(st.UID)
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", st.UID, err)
+			s.rec(record.Entry{
+				Kind: record.KindKeepalive, UID: st.UID, Nickname: nicknameOf(a),
+				Status: record.StatusFailed, Message: "token 已刷新但落盘失败: " + err.Error(), Credits: -1,
+			})
+			continue
 		}
+		s.rec(record.Entry{
+			Kind: record.KindKeepalive, UID: st.UID, Nickname: nicknameOf(a),
+			Status: record.StatusOK, Message: "token 刷新成功", Credits: -1,
+		})
 	}
 }

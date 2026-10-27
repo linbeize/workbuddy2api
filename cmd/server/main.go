@@ -15,6 +15,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -95,6 +96,16 @@ func main() {
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 
+	// 定时任务执行记录（签到/旅行/保活）：原先只打 stdout，容器日志一滚动就
+	// 查不到，面板也无从展示。这里落盘 + 暴露 /v1/records。
+	// 必须在 scheduler 之前创建——scheduler 要在任务里写入它。
+	var recordCollector *record.Collector
+	if cfg.Server.RecordsEnabled {
+		recordCollector = record.New(cfg.Server.RecordsFile)
+		recordCollector.SetMax(cfg.Server.RecordsMax)
+		defer recordCollector.Flush()
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,
 		Upstream:          up,
@@ -102,6 +113,7 @@ func main() {
 		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
 		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
 		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
+		Record:            recordCollector,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -144,6 +156,18 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20,
 		Metrics:      metricsCollector,
+		Record:       recordCollector,
+		// 手动触发：无鉴权层限制时也受 APIKey 保护（handler 已 withAuth）。
+		RunTask: func(kind string) {
+			switch kind {
+			case "checkin":
+				go sch.RunCheckinNow()
+			case "keepalive":
+				go sch.RunKeepaliveNow()
+			case "travel":
+				go sch.RunTravelNow()
+			}
+		},
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

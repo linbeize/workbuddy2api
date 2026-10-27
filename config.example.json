@@ -6,7 +6,10 @@
   "server": {
     "max_body_mb": 8,
     "metrics_enabled": true,
-    "metrics_file": "./data/metrics.json"
+    "metrics_file": "./data/metrics.json",
+    "records_enabled": true,
+    "records_file": "./data/records.json",
+    "records_max": 2000
   },
   "cooldown": {
     "soft_rate": "600s",

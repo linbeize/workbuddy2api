@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/record"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -32,6 +34,11 @@ type Config struct {
 	// Metrics 请求统计收集器（可选；nil = 不统计）。
 	// 网关是所有流量（含非面板客户端）的唯一必经点，统计在此采集。
 	Metrics *metrics.Collector
+	// Record 定时任务执行记录（签到/旅行/保活）；nil = 不记录。
+	Record *record.Collector
+	// RunTask 手动触发定时任务（"checkin"/"keepalive"/"travel"）。
+	// nil = 该能力关闭（未接线或只读模式）。
+	RunTask func(kind string)
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -87,6 +94,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
 	h.mux.HandleFunc("GET /v1/quota", h.withAuth(h.quota))
+	// 定时任务执行记录：签到 / 猫猫旅行 / token 保活的历史结果。
+	// 这些原先只打 stdout（容器日志一滚动就没），面板无法展示。
+	h.mux.HandleFunc("GET /v1/records", h.withAuth(h.records))
+	h.mux.HandleFunc("POST /v1/records/run", h.withAuth(h.runTask))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -908,5 +919,99 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"type":    "api_error",
 			"code":    code,
 		},
+	})
+}
+
+// records 返回定时任务的执行记录（最新在前）。
+//
+// 查询参数（均可选）：
+//
+//	kind=checkin|travel|keepalive   只看某类任务
+//	uid=<账号 UID>                  只看该账号
+//	since=RFC3339 / until=RFC3339   时间范围
+//	limit=<n>                       最多返回条数（默认 200）
+//
+// 同时返回汇总（今日成功/失败/获得积分），供面板顶部卡片展示。
+func (h *Handler) records(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Record == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"message": "执行记录未启用（server.records_enabled=false）",
+			"items":   []any{},
+		})
+		return
+	}
+	q := record.Query{
+		Kind: record.Kind(strings.TrimSpace(r.URL.Query().Get("kind"))),
+		UID:  strings.TrimSpace(r.URL.Query().Get("uid")),
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("since")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			q.Since = t
+		}
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("until")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			q.Until = t
+		}
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			q.Limit = n
+		}
+	}
+
+	items := h.cfg.Record.Query(q)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": true,
+		"items":   items,
+		"total":   len(items),
+		"stored":  h.cfg.Record.Len(),
+		"summary": h.cfg.Record.Summary(),
+		"now":     time.Now(),
+	})
+}
+
+// runTask 手动触发一次定时任务（签到 / 保活 / 旅行）。
+//
+// 为什么需要：定时任务只在固定时点跑（签到 9/21 点、保活 22 点），
+// 运维想立刻验证「签到还能用吗」时必须等到时点。此接口先同步跑一遍，
+// 结果同时写入执行记录，随即可在 /v1/records 看到。
+//
+// 注意：会真实调用上游（签到/刷新 token/派猫），不是 dry-run。
+func (h *Handler) runTask(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.RunTask == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "手动触发未启用",
+			"code":  "not_supported",
+		})
+		return
+	}
+	var req struct {
+		Kind string `json:"kind"`
+	}
+	// body 可为空（默认 checkin）。
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
+			return
+		}
+	}
+	kind := strings.ToLower(strings.TrimSpace(req.Kind))
+	switch kind {
+	case "":
+		kind = "checkin"
+	case "checkin", "keepalive", "travel":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "kind 只支持 checkin / keepalive / travel",
+		})
+		return
+	}
+	h.cfg.RunTask(kind)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"kind":    kind,
+		"message": "已执行 " + kind + "，结果见执行记录",
 	})
 }
