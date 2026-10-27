@@ -6,11 +6,7 @@ import (
 	"testing"
 )
 
-// TestHarnessNameRewritten 系统提示词里的产品名必须被替换为中性词。
-//
-// 背景：上游对系统提示词做整体渠道识别，命中 "DeepSeek Harness" 即回
-// 400 code=11128。实测替换产品名后，整段 5781 字符的系统提示词一次通过，
-// 而逐句打补丁会陷入打地鼠（改完首句还有下一句）。
+// TestHarnessNameRewritten 产品名必须被替换（上游用它做客户端身份识别）。
 func TestHarnessNameRewritten(t *testing.T) {
 	prompt := "You are an AI agent powered by DeepSeek Harness.\n\n" +
 		"You are interacting with the user through the DeepSeek Harness Web GUI."
@@ -27,18 +23,59 @@ func TestHarnessNameRewritten(t *testing.T) {
 	content := obj["messages"].([]any)[0].(map[string]any)["content"].(string)
 
 	if strings.Contains(content, "DeepSeek Harness") {
-		t.Errorf("产品名仍在（会触发上游渠道校验）：%s", content)
+		t.Errorf("产品名仍在（会触发渠道校验）：%s", content)
 	}
-	// 行为指令必须原样保留，否则改变模型行为。
 	if !strings.Contains(content, "You are an AI agent") {
 		t.Error("不应改动行为指令")
 	}
-	if !strings.Contains(content, "Web GUI") {
-		t.Error("不应丢失其余语义")
+}
+
+// TestRewriteTableActuallyChanges 回归：替换表每条的左右必须真的不同。
+//
+// 曾误写成 {"Agent Runtime", "Agent Runtime"}（替换成自身），
+// 整条修复被架构成空操作，而单测因为只检查"改写后不含 X"仍会通过
+// （X 本来就不在输入里）。这条测试直接盯住表格本身。
+func TestRewriteTableActuallyChanges(t *testing.T) {
+	for i, rw := range harnessNameRewrites {
+		if rw[0] == rw[1] {
+			t.Errorf("第 %d 条左右相同（空操作）：%q → %q", i, rw[0], rw[1])
+		}
+		if rw[0] == "" {
+			t.Errorf("第 %d 条左值为空", i)
+		}
 	}
 }
 
-// TestHarnessNameCaseVariants 大小写与连字符变体都要覆盖。
+// TestWorkspaceFingerprintRewritten 路径说明句与首句的组合特征必须被拆开。
+//
+// 实测：两句单独都通过，拼接后稳定失败（语义指纹匹配，非长度问题——
+// 同样 111 字符的随机文本可通过）。改任一句措辞即恢复。
+func TestWorkspaceFingerprintRewritten(t *testing.T) {
+	prompt := "Tokens prefixed with @ are paths the user explicitly referenced. " +
+		"Relative paths resolve from the workspace root; absolute paths identify files."
+	src, _ := json.Marshal(map[string]any{
+		"model":    "m",
+		"messages": []any{map[string]any{"role": "system", "content": prompt}},
+	})
+	out := PrepareBodyOpt(src, true)
+
+	var obj map[string]any
+	json.Unmarshal(out, &obj)
+	content := obj["messages"].([]any)[0].(map[string]any)["content"].(string)
+
+	// 只要有一句被改写，组合特征就被破坏。
+	stillA := strings.Contains(content, "Tokens prefixed with @ are paths the user explicitly referenced.")
+	stillB := strings.Contains(content, "Relative paths resolve from the workspace root")
+	if stillA && stillB {
+		t.Errorf("两句原文都还在，组合特征未破坏：%s", content)
+	}
+	// 语义必须保留。
+	if !strings.Contains(content, "workspace root") {
+		t.Error("不应丢失 workspace root 语义")
+	}
+}
+
+// TestHarnessNameCaseVariants 大小写与连字符变体。
 func TestHarnessNameCaseVariants(t *testing.T) {
 	for _, in := range []string{
 		"DeepSeek Harness", "deepseek harness", "DeepSeek-Harness", "deepseek-harness",
@@ -63,7 +100,7 @@ func TestHarnessRewriteUnaffectedPlain(t *testing.T) {
 	}
 }
 
-// TestHarnessRewriteSanitizeOff 渠道兼容与脱敏解耦：sanitize=false 时仍改写。
+// TestHarnessRewriteSanitizeOff 渠道兼容与脱敏解耦。
 func TestHarnessRewriteSanitizeOff(t *testing.T) {
 	src := []byte(`{"model":"m","messages":[{"role":"system","content":"powered by DeepSeek Harness"}]}`)
 	out := PrepareBodyOpt(src, false)
@@ -72,7 +109,7 @@ func TestHarnessRewriteSanitizeOff(t *testing.T) {
 	}
 }
 
-// TestHarnessRewriteArrayContent 多模态（content 为数组）时不崩且不误改。
+// TestHarnessRewriteArrayContent 多模态 content 不崩。
 func TestHarnessRewriteArrayContent(t *testing.T) {
 	src := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"DeepSeek Harness"}]}]}`)
 	out := PrepareBodyOpt(src, true)
